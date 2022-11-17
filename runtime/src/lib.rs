@@ -15,9 +15,9 @@ use sp_api::impl_runtime_apis;
 use sp_core::{crypto::KeyTypeId, OpaqueMetadata};
 use sp_runtime::{
 	create_runtime_str, curve::PiecewiseLinear, generic, impl_opaque_keys,
-	traits::{AccountIdLookup, BlakeTwo256, Block as BlockT, IdentifyAccount, NumberFor, OpaqueKeys, Verify},
+	traits::{AccountIdLookup, BlakeTwo256, Block as BlockT, Bounded, IdentifyAccount, NumberFor, OpaqueKeys, Verify},
 	transaction_validity::{TransactionPriority, TransactionSource, TransactionValidity},
-	ApplyExtrinsicResult, MultiSignature,
+	ApplyExtrinsicResult, FixedPointNumber, MultiSignature, Perquintill,
 };
 use sp_std::prelude::*;
 #[cfg(feature = "std")]
@@ -33,19 +33,20 @@ mod bag_thresholds;
 // A few exports that help ease life for downstream crates.
 pub use frame_support::{
 	construct_runtime, parameter_types,
+	dispatch::DispatchClass,
 	traits::{
 		ConstU128, ConstU32, ConstU64, ConstU8, KeyOwnerProofSystem, Randomness, StorageInfo,
 	},
 	weights::{
 		constants::{BlockExecutionWeight, ExtrinsicBaseWeight, RocksDbWeight, WEIGHT_PER_SECOND},
-		DispatchClass, IdentityFee, Weight,
+		IdentityFee, Weight,
 	},
 	StorageValue,
 };
 pub use frame_system::Call as SystemCall;
 pub use pallet_balances::Call as BalancesCall;
 pub use pallet_timestamp::Call as TimestampCall;
-use pallet_transaction_payment::CurrencyAdapter;
+use pallet_transaction_payment::{CurrencyAdapter, Multiplier, TargetedFeeAdjustment};
 #[cfg(any(feature = "std", test))]
 pub use sp_runtime::BuildStorage;
 pub use sp_runtime::{Perbill, Permill};
@@ -105,7 +106,7 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 	//   `spec_version`, and `authoring_version` are the same between Wasm and native.
 	// This value is set to 100 to notify Polkadot-JS App (https://polkadot.js.org/apps) to use
 	//   the compatible custom types.
-	spec_version: 9290,
+	spec_version: 9320,
 	impl_version: 0,
 	apis: RUNTIME_API_VERSIONS,
 	transaction_version: 12,
@@ -159,9 +160,9 @@ const NORMAL_DISPATCH_RATIO: Perbill = Perbill::from_percent(75);
 
 impl<C> frame_system::offchain::SendTransactionTypes<C> for Runtime
 where
-	Call: From<C>,
+	RuntimeCall: From<C>,
 {
-	type OverarchingCall = Call;
+	type OverarchingCall = RuntimeCall;
 	type Extrinsic = UncheckedExtrinsic;
 }
 
@@ -169,8 +170,11 @@ parameter_types! {
 	pub const BlockHashCount: BlockNumber = 2400;
 	pub const Version: RuntimeVersion = VERSION;
 	/// We allow for 2 seconds of compute with a 6 second average block time.
-	pub BlockWeights: frame_system::limits::BlockWeights = frame_system::limits::BlockWeights
-		::with_sensible_defaults(2u64 * WEIGHT_PER_SECOND, NORMAL_DISPATCH_RATIO);
+	pub BlockWeights: frame_system::limits::BlockWeights =
+		frame_system::limits::BlockWeights::with_sensible_defaults(
+			(2u64 * WEIGHT_PER_SECOND).set_proof_size(u64::MAX),
+			NORMAL_DISPATCH_RATIO,
+		);
 	pub BlockLength: frame_system::limits::BlockLength = frame_system::limits::BlockLength
 		::max_with_normal_ratio(5 * 1024 * 1024, NORMAL_DISPATCH_RATIO);
 	pub const SS58Prefix: u8 = 42;
@@ -188,7 +192,7 @@ impl frame_system::Config for Runtime {
 	/// The identifier used to distinguish between accounts.
 	type AccountId = AccountId;
 	/// The aggregated dispatch type that is available for extrinsics.
-	type Call = Call;
+	type RuntimeCall = RuntimeCall;
 	/// The lookup mechanism to get account ID from whatever is passed in dispatchers.
 	type Lookup = AccountIdLookup<AccountId, ()>;
 	/// The index type for storing how many extrinsics an account has signed.
@@ -202,9 +206,9 @@ impl frame_system::Config for Runtime {
 	/// The header type.
 	type Header = generic::Header<BlockNumber, BlakeTwo256>;
 	/// The ubiquitous event type.
-	type Event = Event;
+	type RuntimeEvent = RuntimeEvent;
 	/// The ubiquitous origin type.
-	type Origin = Origin;
+	type RuntimeOrigin = RuntimeOrigin;
 	/// Maximum number of block number to block hash mappings to keep (oldest pruned first).
 	type BlockHashCount = BlockHashCount;
 	/// The weight of database operations that the runtime can invoke.
@@ -267,8 +271,7 @@ impl pallet_babe::Config for Runtime {
 }
 
 impl pallet_grandpa::Config for Runtime {
-	type Event = Event;
-	type Call = Call;
+	type RuntimeEvent = RuntimeEvent;
 
 	type KeyOwnerProofSystem = ();
 
@@ -308,20 +311,33 @@ impl pallet_balances::Config for Runtime {
 	/// The type for recording an account's balance.
 	type Balance = Balance;
 	/// The ubiquitous event type.
-	type Event = Event;
+	type RuntimeEvent = RuntimeEvent;
 	type DustRemoval = ();
 	type ExistentialDeposit = ConstU128<EXISTENTIAL_DEPOSIT>;
 	type AccountStore = System;
 	type WeightInfo = pallet_balances::weights::SubstrateWeight<Runtime>;
 }
 
+parameter_types! {
+	pub const TargetBlockFullness: Perquintill = Perquintill::from_percent(25);
+	pub AdjustmentVariable: Multiplier = Multiplier::saturating_from_rational(1, 100_000);
+	pub MinimumMultiplier: Multiplier = Multiplier::saturating_from_rational(1, 1_000_000_000u128);
+	pub MaximumMultiplier: Multiplier = Bounded::max_value();
+}
+
 impl pallet_transaction_payment::Config for Runtime {
-	type Event = Event;
+	type RuntimeEvent = RuntimeEvent;
 	type OnChargeTransaction = CurrencyAdapter<Balances, ()>;
 	type OperationalFeeMultiplier = ConstU8<5>;
 	type WeightToFee = IdentityFee<Balance>;
 	type LengthToFee = IdentityFee<Balance>;
-	type FeeMultiplierUpdate = ();
+	type FeeMultiplierUpdate = TargetedFeeAdjustment<
+		Self,
+		TargetBlockFullness,
+		AdjustmentVariable,
+		MinimumMultiplier,
+		MaximumMultiplier,
+	>;
 }
 
 parameter_types! {
@@ -343,7 +359,7 @@ impl_opaque_keys! {
 }
 
 impl pallet_session::Config for Runtime {
-	type Event = Event;
+	type RuntimeEvent = RuntimeEvent;
 	type ValidatorId = AccountId;
 	type ValidatorIdOf = pallet_staking::StashOf<Self>;
 	type ShouldEndSession = Babe;
@@ -459,7 +475,7 @@ impl pallet_election_provider_multi_phase::MinerConfig for Runtime {
 }
 
 impl pallet_election_provider_multi_phase::Config for Runtime {
-	type Event = Event;
+	type RuntimeEvent = RuntimeEvent;
 	type Currency = Balances;
 	type EstimateCallFee = TransactionPayment;
 	type SignedPhase = SignedPhase;
@@ -500,7 +516,7 @@ parameter_types! {
 }
 
 impl pallet_bags_list::Config for Runtime {
-	type Event = Event;
+	type RuntimeEvent = RuntimeEvent;
 	type ScoreProvider = Staking;
 	type WeightInfo = ();
 	type BagThresholds = BagThresholds;
@@ -525,6 +541,7 @@ parameter_types! {
 	pub const MaxNominatorRewardedPerValidator: u32 = 64;
 	pub const OffendingValidatorsThreshold: Perbill = Perbill::from_percent(17);
 	pub const MaxNominations: u32 = 64;
+	pub const HistoryDepth: u32 = 84;
 }
 
 pub struct StakingBenchmarkingConfig;
@@ -540,7 +557,7 @@ impl pallet_staking::Config for Runtime {
 	type UnixTime = Timestamp;
 	type CurrencyToVote = frame_support::traits::U128CurrencyToVote;
 	type RewardRemainder = ();
-	type Event = Event;
+	type RuntimeEvent = RuntimeEvent;
 	type Slash = ();
 	type Reward = ();
 	type SessionsPerEra = SessionsPerEra;
@@ -556,15 +573,18 @@ impl pallet_staking::Config for Runtime {
 	type ElectionProvider = ElectionProviderMultiPhase;
 	type GenesisElectionProvider = onchain::UnboundedExecution<OnChainSeqPhragmen>;
 	type VoterList = BagsList;
+	// This a placeholder, to be introduced in the next PR as an instance of bags-list
+	type TargetList = pallet_staking::UseValidatorsMap<Self>;
 	type MaxUnlockingChunks = frame_support::traits::ConstU32<32>;
+	type HistoryDepth = HistoryDepth;
 	type BenchmarkingConfig = StakingBenchmarkingConfig;
 	type OnStakerSlash = ();
 	type WeightInfo = ();
 }
 
 impl pallet_sudo::Config for Runtime {
-	type Event = Event;
-	type Call = Call;
+	type RuntimeEvent = RuntimeEvent;
+	type RuntimeCall = RuntimeCall;
 }
 
 // Create the runtime by composing the FRAME pallets that were previously configured.
@@ -608,10 +628,12 @@ pub type SignedExtra = (
 	frame_system::CheckWeight<Runtime>,
 	pallet_transaction_payment::ChargeTransactionPayment<Runtime>,
 );
+
 /// Unchecked extrinsic type as expected by this runtime.
-pub type UncheckedExtrinsic = generic::UncheckedExtrinsic<Address, Call, Signature, SignedExtra>;
+pub type UncheckedExtrinsic =
+	generic::UncheckedExtrinsic<Address, RuntimeCall, Signature, SignedExtra>;
 /// The payload being signed in transactions.
-pub type SignedPayload = generic::SignedPayload<Call, SignedExtra>;
+pub type SignedPayload = generic::SignedPayload<RuntimeCall, SignedExtra>;
 /// Executive: handles dispatch to the various modules.
 pub type Executive = frame_executive::Executive<
 	Runtime,
@@ -806,17 +828,17 @@ impl_runtime_apis! {
 		}
 	}
 
-	impl pallet_transaction_payment_rpc_runtime_api::TransactionPaymentCallApi<Block, Balance, Call>
+	impl pallet_transaction_payment_rpc_runtime_api::TransactionPaymentCallApi<Block, Balance, RuntimeCall>
 		for Runtime
 	{
 		fn query_call_info(
-			call: Call,
+			call: RuntimeCall,
 			len: u32,
 		) -> pallet_transaction_payment::RuntimeDispatchInfo<Balance> {
 			TransactionPayment::query_call_info(call, len)
 		}
 		fn query_call_fee_details(
-			call: Call,
+			call: RuntimeCall,
 			len: u32,
 		) -> pallet_transaction_payment::FeeDetails<Balance> {
 			TransactionPayment::query_call_fee_details(call, len)
@@ -853,18 +875,8 @@ impl_runtime_apis! {
 			impl frame_system_benchmarking::Config for Runtime {}
 			impl baseline::Config for Runtime {}
 
-			let whitelist: Vec<TrackedStorageKey> = vec![
-				// Block Number
-				hex_literal::hex!("26aa394eea5630e07c48ae0c9558cef702a5c1b19ab7a04f536c519aca4983ac").to_vec().into(),
-				// Total Issuance
-				hex_literal::hex!("c2261276cc9d1f8598ea4b6a74b15c2f57c875e4cff74148e4628f264b974c80").to_vec().into(),
-				// Execution Phase
-				hex_literal::hex!("26aa394eea5630e07c48ae0c9558cef7ff553b5a9862a516939d82b3d3d8661a").to_vec().into(),
-				// Event Count
-				hex_literal::hex!("26aa394eea5630e07c48ae0c9558cef70a98fdbe9ce6c55837576c60c7af3850").to_vec().into(),
-				// System Events
-				hex_literal::hex!("26aa394eea5630e07c48ae0c9558cef780d41e5e16056765bc8461851072c9d7").to_vec().into(),
-			];
+			use frame_support::traits::WhitelistedStorageKeys;
+			let whitelist: Vec<TrackedStorageKey> = AllPalletsWithSystem::whitelisted_storage_keys();
 
 			let mut batches = Vec::<BenchmarkBatch>::new();
 			let params = (&config, &whitelist);
@@ -893,5 +905,42 @@ impl_runtime_apis! {
 			// have a backtrace here.
 			Executive::try_execute_block(block, state_root_check, select).expect("execute-block failed")
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use frame_support::traits::WhitelistedStorageKeys;
+	use sp_core::hexdisplay::HexDisplay;
+	use std::collections::HashSet;
+
+	#[test]
+	fn check_whitelist() {
+		let whitelist: HashSet<String> = AllPalletsWithSystem::whitelisted_storage_keys()
+			.iter()
+			.map(|e| HexDisplay::from(&e.key).to_string())
+			.collect();
+
+		// Block Number
+		assert!(
+			whitelist.contains("26aa394eea5630e07c48ae0c9558cef702a5c1b19ab7a04f536c519aca4983ac")
+		);
+		// Total Issuance
+		assert!(
+			whitelist.contains("c2261276cc9d1f8598ea4b6a74b15c2f57c875e4cff74148e4628f264b974c80")
+		);
+		// Execution Phase
+		assert!(
+			whitelist.contains("26aa394eea5630e07c48ae0c9558cef7ff553b5a9862a516939d82b3d3d8661a")
+		);
+		// Event Count
+		assert!(
+			whitelist.contains("26aa394eea5630e07c48ae0c9558cef70a98fdbe9ce6c55837576c60c7af3850")
+		);
+		// System Events
+		assert!(
+			whitelist.contains("26aa394eea5630e07c48ae0c9558cef780d41e5e16056765bc8461851072c9d7")
+		);
 	}
 }

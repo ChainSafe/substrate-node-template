@@ -1,7 +1,7 @@
 //! Service and ServiceFactory implementation. Specialized wrapper over substrate service.
 
 use gssmr_test_runtime::{self, opaque::Block, RuntimeApi};
-use sc_client_api::{BlockBackend, ExecutorProvider};
+use sc_client_api::BlockBackend;
 use sc_consensus_babe::{self, SlotProportion};
 pub use sc_executor::NativeElseWasmExecutor;
 use sc_finality_grandpa::SharedVoterState;
@@ -9,7 +9,6 @@ use sc_keystore::LocalKeystore;
 use sc_service::{error::Error as ServiceError, Configuration, TaskManager};
 use sc_telemetry::{Telemetry, TelemetryWorker};
 use std::{sync::Arc, time::Duration};
-use sp_runtime::traits::Block as BlockT;
 
 // Our native executor instance.
 pub struct ExecutorDispatch;
@@ -117,6 +116,7 @@ pub fn new_partial(
 		client.clone(),
 	)?;
 
+	let client_clone = client.clone();
 	let slot_duration = babe_link.config().slot_duration();
 
 	let import_queue =
@@ -126,23 +126,33 @@ pub fn new_partial(
 		Some(Box::new(justification_import)),
 		client.clone(),
 		select_chain.clone(),
-		move |_, ()| async move {
-			let timestamp = sp_timestamp::InherentDataProvider::from_system_time();
+		move |parent, ()| {
+			let client_clone = client_clone.clone();
+			async move {
+				let uncles = sc_consensus_uncles::create_uncles_inherent_data_provider(
+					&*client_clone,
+					parent,
+				)?;
 
-			let slot =
-				sp_consensus_babe::inherents::InherentDataProvider::from_timestamp_and_slot_duration(
-					*timestamp,
-					slot_duration,
-				);
+				let timestamp = sp_timestamp::InherentDataProvider::from_system_time();
 
-			let uncles =
-				sp_authorship::InherentDataProvider::<<Block as BlockT>::Header>::check_inherents();
+				let slot =
+					sp_consensus_babe::inherents::InherentDataProvider::from_timestamp_and_slot_duration(
+						*timestamp,
+						slot_duration,
+					);
 
-			Ok((timestamp, slot, uncles))
+				let storage_proof =
+					sp_transaction_storage_proof::registration::new_data_provider(
+						&*client_clone,
+						&parent,
+					)?;
+
+				Ok((slot, timestamp, uncles, storage_proof))
+			}
 		},
 		&task_manager.spawn_essential_handle(),
 		config.prometheus_registry(),
-		sp_consensus::CanAuthorWithNativeVersion::new(client.executor().clone()),
 		telemetry.as_ref().map(|x| x.handle()),
 	)?;
 
@@ -205,7 +215,7 @@ pub fn new_full(mut config: Configuration) -> Result<TaskManager, ServiceError> 
 		Vec::default(),
 	));
 
-	let (network, system_rpc_tx, network_starter) =
+	let (network, system_rpc_tx, tx_handler_controller, network_starter) =
 		sc_service::build_network(sc_service::BuildNetworkParams {
 			config: &config,
 			client: client.clone(),
@@ -252,6 +262,7 @@ pub fn new_full(mut config: Configuration) -> Result<TaskManager, ServiceError> 
 		rpc_builder: rpc_extensions_builder,
 		backend,
 		system_rpc_tx,
+		tx_handler_controller,
 		config,
 		telemetry: telemetry.as_mut(),
 	})?;
@@ -266,9 +277,6 @@ pub fn new_full(mut config: Configuration) -> Result<TaskManager, ServiceError> 
 			prometheus_registry.as_ref(),
 			telemetry.as_ref().map(|x| x.handle()),
 		);
-
-		let can_author_with =
-			sp_consensus::CanAuthorWithNativeVersion::new(client.executor().clone());
 
 		let client_clone = client.clone();
 		let slot_duration = babe_link.config().slot_duration();
@@ -302,13 +310,12 @@ pub fn new_full(mut config: Configuration) -> Result<TaskManager, ServiceError> 
 							&parent,
 						)?;
 
-					Ok((timestamp, slot, uncles, storage_proof))
+					Ok((slot, timestamp, uncles, storage_proof))
 				}
 			},
 			force_authoring,
 			backoff_authoring_blocks,
 			babe_link,
-			can_author_with,
 			block_proposal_slot_portion: SlotProportion::new(0.5),
 			max_block_proposal_slot_portion: None,
 			telemetry: telemetry.as_ref().map(|x| x.handle()),
